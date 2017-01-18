@@ -52,7 +52,7 @@ module Language.Haskell.Liquid.Constraint.Types
   , addArgument, addArguments
 
   -- * Axiom Instantiation
-  , AxiomEnv(..), Equation(..)
+  , AxiomEnv(..), Equation(..), Simplify(..), Identity
   ) where
 
 import Prelude hiding (error)
@@ -131,6 +131,7 @@ instance Show CGEnv where
 
 data AxiomEnv = AEnv { aenvSyms    :: [F.Symbol]
                      , aenvEqs     :: [Equation]
+                     , aenvSims    :: [Simplify]
                      , aenvFuel    :: (FixSubC -> Int) 
                      , aenvExpand  :: (FixSubC -> Bool)
                      , aenvVerbose :: Bool 
@@ -140,6 +141,11 @@ data Equation = Eq   { eqName :: F.Symbol
                      , eqArgs :: [F.Symbol]
                      , eqBody :: F.Expr
                      } deriving (Show)
+
+data Simplify = Simpl {sname :: F.Symbol, sargs :: [F.Symbol], scomplex :: F.Expr, ssimple :: F.Expr }
+  deriving (Show, Eq)
+
+type Identity = (F.Symbol, F.Symbol)
 
 --------------------------------------------------------------------------------
 -- | Subtyping Constraints -----------------------------------------------------

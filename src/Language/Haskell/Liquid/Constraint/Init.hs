@@ -50,6 +50,7 @@ import           Language.Haskell.Liquid.Types.Literals
 import           Language.Haskell.Liquid.Constraint.Types
 import           Language.Haskell.Liquid.GHC.Misc              (dropModuleNames)
 
+import           Language.Fixpoint.Types.Visitor (size)
 -- import Debug.Trace (trace)
 
 --------------------------------------------------------------------------------
@@ -295,11 +296,19 @@ coreBindLits tce info
 makeAxiomEnvironment :: GhcInfo -> [(Var, SpecType)]  -> AxiomEnv 
 makeAxiomEnvironment info xts
   = AEnv ((axiomName <$> gsAxioms (spec info)) ++ (F.symbol . fst <$> xts))
-         (makeEquations info ++ (specTypToEq  <$> xts) )
+         eqs
+         sis 
+
          (\sub -> fromMaybe (fuel cfg) (fuelNumber sub))
          doExpand
          (debugInstantionation cfg)
   where
+    eqs = makeEquations info  ++ (specTypToEq  <$> xts)
+
+    ids = concatMap equationToIdentities eqs 
+    sis = concatMap (equationToSimplifies ids) eqs
+
+
     doExpand sub = allowLiquidInstationationGlobal cfg
                 || (allowLiquidInstationationLocal cfg 
                    && (maybe False (`M.member` (gsAutoInst (spec info))) (subVar sub)))
@@ -312,6 +321,52 @@ makeAxiomEnvironment info xts
     specTypToEq (x, t) 
       = Eq (F.symbol x) (ty_binds $ toRTypeRep t) 
            (specTypeToResultRef (F.eApps (F.EVar $ F.symbol x) (F.EVar <$> ty_binds (toRTypeRep t))) t)
+
+
+applyIdentity :: (F.Subable e, Eq e) => e -> Identity -> [e]
+applyIdentity simp (x, y) 
+  = L.nub [F.subst1 simp (x, F.EVar y), F.subst1 simp (y, F.EVar x), simp]
+
+applyIdentities :: (F.Subable e, Eq e) => e -> [Identity] -> [e]
+applyIdentities e is = concatMap (applyIdentity e) is 
+
+instance F.Subable Simplify where
+  syms     (Simpl _ _  e1 e2) = F.syms e1 ++ F.syms e2
+  substa f (Simpl n xs e1 e2) = Simpl n xs (F.substa f e1) (F.substa f e2)
+  substf f (Simpl n xs e1 e2) = Simpl n xs (F.substf f e1) (F.substf f e2)
+  subst su (Simpl n xs e1 e2) = Simpl n xs (F.subst su e1) (F.subst su e2)
+
+equationToSimplifies :: [Identity] -> Equation -> [Simplify]
+equationToSimplifies ids eq 
+  = concatMap (`applyIdentities` ids) [Simpl (eqName eq) (eqArgs eq) complex simple | Just (simple, complex) <- grepSimplifies <$> splitPAnd (eqBody eq)]
+  where 
+
+    grepSimplifies (F.PAtom F.Eq simple complex)
+      | isSimple simple && size simple < size complex 
+      = Just (simple, complex)
+    grepSimplifies (F.PAtom F.Eq complex simple)
+      | isSimple simple && size simple < size complex 
+      = Just (simple, complex)
+    grepSimplifies _ 
+      = Nothing
+
+    isSimple (F.EVar _) = True 
+    isSimple _        = False 
+
+
+equationToIdentities :: Equation -> [Identity]
+equationToIdentities eq 
+  = [(f1, f2) | F.PAtom F.Eq e1 e2 <- splitPAnd (eqBody eq)
+              , (F.EVar f1, es1)   <- [F.splitEApp e1]
+              , (F.EVar f2, es2)   <- [F.splitEApp e2]
+              , es1 == es2
+              , not (f1 `elem` eqArgs eq)
+              , not (f2 `elem` eqArgs eq)]
+
+splitPAnd  :: F.Expr -> [F.Expr]
+splitPAnd (F.PAnd es) = concatMap splitPAnd es 
+splitPAnd e         = [e]
+
 
 makeEquations :: GhcInfo -> [Equation]
 makeEquations info 
