@@ -52,7 +52,7 @@ module Language.Haskell.Liquid.Constraint.Types
   , addArgument, addArguments
 
   -- * Axiom Instantiation
-  , AxiomEnv(..), Equation(..), Simplify(..), Identity
+  , AxiomEnv(..), Equation(..), Simplify(..), Identity, EqInfo(..)
   ) where
 
 import Prelude hiding (error)
@@ -140,7 +140,10 @@ data AxiomEnv = AEnv { aenvSyms    :: [F.Symbol]
 data Equation = Eq   { eqName :: F.Symbol
                      , eqArgs :: [F.Symbol]
                      , eqBody :: F.Expr
+                     , eqInfo :: EqInfo
                      } deriving (Show)
+
+data EqInfo = EqAxiom | EqMeasure deriving (Show, Eq)
 
 data Simplify = Simpl {sname :: F.Symbol, sargs :: [F.Symbol], scomplex :: F.Expr, ssimple :: F.Expr }
   deriving (Show, Eq)

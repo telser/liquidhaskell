@@ -321,6 +321,7 @@ makeAxiomEnvironment info xts
     specTypToEq (x, t) 
       = Eq (F.symbol x) (ty_binds $ toRTypeRep t) 
            (specTypeToResultRef (F.eApps (F.EVar $ F.symbol x) (F.EVar <$> ty_binds (toRTypeRep t))) t)
+           EqMeasure
 
 
 applyIdentity :: (F.Subable e, Eq e) => e -> Identity -> [e]
@@ -370,7 +371,7 @@ splitPAnd e         = [e]
 
 makeEquations :: GhcInfo -> [Equation]
 makeEquations info 
-  = [ Eq x xs (F.pAnd [makeEqBody x xs e, makeRefBody x xs (lookupSpecType x (gsTySigs $ spec info))]) | AxiomEq x xs e _ <- gsAxioms (spec info)]
+  = [ Eq x xs (F.PAnd [makeEqBody x xs e, makeRefBody x xs (lookupSpecType x (gsTySigs $ spec info))]) EqAxiom | AxiomEq x xs e _ <- gsAxioms (spec info)]
   where
     makeEqBody x xs e = F.PAtom F.Eq (F.eApps (F.EVar x) (F.EVar <$> xs)) e
     lookupSpecType x xts = L.lookup x ((mapFst (dropModuleNames . simplesymbol)) <$> xts)

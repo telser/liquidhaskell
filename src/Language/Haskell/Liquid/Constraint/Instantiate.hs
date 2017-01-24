@@ -5,6 +5,7 @@
 {-# LANGUAGE TupleSections         #-}
 {-# LANGUAGE BangPatterns          #-}
 {-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE DoAndIfThenElse       #-}
 
 --------------------------------------------------------------------------------
 -- | Axiom Instantiation  ------------------------------------------------------
@@ -19,7 +20,7 @@ module Language.Haskell.Liquid.Constraint.Instantiate (
 
 -- import           Language.Fixpoint.Misc            
 import           Language.Fixpoint.Types hiding (Eq, simplify)
--- import qualified Language.Fixpoint.Types as F        
+import qualified Language.Fixpoint.Types as F        
 import           Language.Fixpoint.Types.Visitor (eapps, mapExpr)            
 
 import           Language.Haskell.Liquid.Constraint.Types hiding (senv)
@@ -29,6 +30,9 @@ import qualified Data.List as L
 import Data.Maybe (catMaybes)
 
 import qualified Debug.Trace as T 
+
+import System.IO.Unsafe
+import Control.Monad
 
 trace :: AxiomEnv -> String -> a -> a 
 trace aenv str x 
@@ -44,7 +48,7 @@ instantiateAxioms _  aenv sub
 instantiateAxioms bds aenv sub 
   = strengthenLhs (pAnd is) sub
   where
-    is               = instances maxNumber aenv (trace aenv initMsg $ initOccurences)
+    is               = instances maxNumber aenv (pAnd initExpressions) (trace aenv initMsg $ initOccurences)
     initExpressions  = (expr $ slhs sub):(expr $ srhs sub):(expr <$> envCs bds (senv sub))
     initOccurences   = concatMap (makeInitOccurences as eqs) initExpressions
 
@@ -64,12 +68,100 @@ instantiateAxioms bds aenv sub
               " can generate up to " ++ show maxNumber ++ " instantiations\n" 
 
 
-instances :: Int -> AxiomEnv -> [Occurence] -> [Expr] 
-instances maxIs aenv !occs 
-  = (eqBody <$> eqsZero) ++ is
+instances :: Int -> AxiomEnv -> Expr -> [Occurence] -> [Expr] 
+instances maxIs aenv einit !occs 
+  = (eqBody <$> eqsZero) ++ is ++ evals 
   where
     (eqsZero, eqs) = L.partition (null . eqArgs) (aenvEqs  aenv)
-    is             = instancesLoop aenv maxIs eqs occs
+    is             = instancesLoop aenv maxIs einit eqs occs
+    evals          = concatMap (runLazyEval aenv) occs 
+
+
+-------------------------------------------------------------------------------
+--------  Equations by Lazy Evaluation ----------------------------------------
+-------------------------------------------------------------------------------
+
+{-
+
+seq (seq (seq (pure compose) x) y) z
+-> 
+seq (seq (seq (Just compose) x) y) z
+-> 
+seq (seq (Just ((fromJust (Just compose)) fromJust x)) y) z
+-> 
+seq (seq (Just (compose (fromJust x))) y) z
+-> 
+seq (seq (Just (compose (fromJust x))) y) z
+
+-}
+
+
+runLazyEval :: AxiomEnv -> Occurence -> [Expr]
+runLazyEval aenv occ 
+  = T.trace ("INIT EVAL EQUATIONS FOR = " ++ show occ ++ "\nARE\n" ++ showpp eqs ++ "\nEVALS\n" ++ showpp es) eqs
+  where 
+    eqs = catMaybes [ (PAtom F.Eq e) <$> evalOne eq e | eq <- aenvEqs aenv, e <- oargs occ, eqInfo eq == EqAxiom]
+    es  = evaluate 5 (aenvEqs aenv) $ eApps (EVar (ofun occ)) (oargs occ)
+
+-- seq (seq (pure compose) x##a1gY) y##a1gZ
+
+
+evaluate :: Int -> [Equation] -> Expr -> (Int, Expr) 
+evaluate i eqs e 
+  | null es = (i, e)
+  | otherwise
+  = eval j (eApps f es')
+  where 
+    (f, es) = splitEApp e 
+    (j, es') = evals i [] es
+
+    evals i acc es | i <= 0 = (i, (acc ++ es)
+    evals i acc (e:es) = let (j, e') = evaluate i eqs e in 
+                         if j < i then evals j acc (e':es)
+                         else let (jj, e'') = eval i e in 
+                         if jj == i then evals i (e':acc) es else  evals jj acc (e'':es)
+    evals i acc []  = (i, reverse acc)
+
+
+    eval i e | i <= 0 = (i, e)
+    eval i e = case catMaybes [evalOne eq e | eq <- eqs] of
+                  e':_ -> (i-1, T.trace ("\nEVAL:\n" ++ showpp e ++ " -> " ++ showpp e'++ "\n") e')
+                  []   -> (i, T.trace ("\nDoes not evaluate: " ++ showpp e) e)   
+
+
+evalOne :: Equation -> Expr -> Maybe Expr 
+evalOne eq e
+  | (EVar x, es) <-  splitEApp e 
+  , eqName eq == x 
+  , length (eqArgs eq) == length es 
+  -- CHECK THIS 
+  , PAnd (PAtom F.Eq v ebd:_) <- eqBody eq
+  , v == F.eApps (F.EVar x) (F.EVar <$> eqArgs eq)
+  = Just $ subst (mkSubst (zip (eqArgs eq) es)) ebd
+  | otherwise
+  = Nothing 
+
+{- 
+evalOne eq e 
+  = T.trace ("\nBad eq\n" ++ show eq ++ "\nFOR\n" ++ showpp e ++ "\nSPLIT\n" ++ showpp e
+             ++ "\nCMP1 = " ++ show (EVar (eqName eq) == f)
+             ++ "\nCMP2 = " ++ show (length (eqArgs eq) == length xs)
+             ++ "\nCMP3 = " ++ show (checkEq (eqBody eq)) 
+            ) Nothing 
+  where
+    (f, xs) = splitEApp e 
+    checkEq (PAtom F.Eq _ _) = True 
+    checkEq _ = False
+-}
+
+
+
+
+
+
+
+
+
 
 -- Currently: Instantiation happens arbitrary times (in recursive functions it diverges)
 -- Step 1: Hack it so that instantiation of axiom A happens from an occurences and its 
@@ -77,22 +169,62 @@ instances maxIs aenv !occs
 -- How? Hack expressions to contatin fuel info within eg Cst
 -- Step 2: Compute fuel based on Ranjit's algorithm
 
-instancesLoop :: AxiomEnv -> Int ->  [Equation] -> [Occurence] -> [Expr]
-instancesLoop aenv maxIns eqs = go 0 [] 
+instancesLoop :: AxiomEnv -> Int -> Expr ->  [Equation] -> [Occurence] -> [Expr]
+instancesLoop aenv maxIns _einit eqs = go 0 [] []
   where 
-    go :: Int -> [Expr] -> [Occurence] -> [Expr]
-    go !i acc occs = let is      = concatMap (applySimplifications (aenvSims aenv)) $ concatMap (unfold eqs) occs 
-                         newIs   = findNewEqs is acc 
-                         newOccs = nubOccurences $ concatMap (grepOccurences eqs) newIs
-                         msg     = show (i + length newIs) ++ "/" ++ (show maxIns) --  ++  "\n\nNewExpr\n" ++ L.intercalate "\n" (showExpr . fst <$> newIs)  -- ++ "\n\nOccurences\n" ++ show occs ++   "\n\nEquations\n" ++ show eqs ++  "\n\nNew Occs\n" ++ show newOccs ++ )
-                     in  if null newIs then acc else go (trace aenv msg (i + length newIs)) ((fst <$> newIs) ++ acc) newOccs
+    go :: Int -> [Expr] -> [Occurence] -> [Occurence] -> [Expr]
+    go !i acc oldoccs occs = let is      = concatMap (applySimplifications (aenvSims aenv)) $ concatMap (unfold eqs) occs 
+                                 newIs   = findNewEqs is acc 
+                                 newOccs = {- selectOccs $ -} filter (not . (\e -> elemBy eqOcc e oldoccs)) $ nubOccurences $ concatMap (grepOccurences eqs) newIs
+                                 msg     = show (i + length newIs) ++ "/" ++ (show maxIns) --  ++  "\n\nNewOccs\n" ++ L.intercalate "\n" (show  <$> filter (\oc -> oinfo oc == EqAxiom) newOccs) -- ++ L.intercalate "\n" (showExpr . fst <$> newIs)  -- ++ "\n\nOccurences\n" ++ show occs ++   "\n\nEquations\n" ++ show eqs ++  "\n\nNew Occs\n" ++ show newOccs ++ )
+                             in  if null newIs then acc else go (trace aenv msg (i + length newIs)) ((fst <$> newIs) ++ acc) (oldoccs ++ occs) newOccs
+
+
+
+elemBy :: (a -> a -> Bool) -> a -> [a] -> Bool
+elemBy _ _ [] = False
+elemBy cmp x (y:ys) 
+  | cmp x y   = True 
+  | otherwise = elemBy cmp x ys 
+
+_selectOccs :: [Occurence] -> [Occurence]
+_selectOccs occs = unsafePerformIO $ do 
+  putStrLn "Do you want to select occurences? [Y/N]"
+  c <- getYNChar
+  if (c == 'N') 
+    then (return occs)
+    else (putStrLn ("All occs = " ++ show occs) >> filterM selectOc occs)
+
+  where
+  selectOc oc | oinfo oc == EqMeasure = return True  
+  selectOc oc = 
+    do putStrLn ("Keep that? [Y/N]\n" ++ show oc)
+       c <- getYNChar
+       return (c == 'Y')
+
+  getYNChar = do 
+    c <- getChar 
+    if (c == 'Y' || c == 'y')
+      then return 'Y'
+      else if (c == 'N' || c == 'n')
+        then return 'N'
+        else (putStrLn "Type Y or N" >> getYNChar)
+
 
 nubOccurences :: [Occurence] -> [Occurence]
-nubOccurences occs = mergeOccs <$> L.groupBy eqOcc occs 
+nubOccurences occs = mergeOccs <$> groupBy eqOcc occs
   where
-    eqOcc occ1 occ2 = oargs occ1 == oargs occ2 && ofun occ1 == ofun occ2 
     mergeOccs x = (head x){ofuel = maxFuelMap (map ofuel x)}
 
+eqOcc :: Occurence -> Occurence -> Bool
+eqOcc occ1 occ2 = oargs occ1 == oargs occ2 && ofun occ1 == ofun occ2 
+
+
+groupBy :: (a -> a -> Bool) -> [a] -> [[a]]
+groupBy _ []     = [] 
+groupBy cmp (x:xs) = (x:xs1):groupBy cmp xs2
+  where
+    (xs1,xs2) = L.partition (cmp x) xs
 
 maxFuelMap :: [FuelMap] -> FuelMap
 maxFuelMap fs = mergeMax <$> L.transpose fs
@@ -116,7 +248,7 @@ simplify si ee  = if ee == esimple then Nothing else Just $  esimple
   where
     esimple = mapExpr f ee 
     f e = case unify (sargs si) (scomplex si) e of 
-            Just su -> let simple = subst (mkSubst su) (ssimple si) in T.trace ("\n\nSimplify\n" ++ showpp e ++ "\nto\n" ++ showpp simple ++ "\nin\n" ++ showpp ee) simple
+            Just su -> let simple = subst (mkSubst su) (ssimple si) in simple -- T.trace ("\n\nSimplify\n" ++ showpp e ++ "\nto\n" ++ showpp simple ++ "\nin\n" ++ showpp ee) simple
             Nothing -> e
 
 unify :: [Symbol] -> Expr -> Expr -> Maybe [(Symbol, Expr)]
@@ -149,24 +281,24 @@ unify xs ex e = go [] ex e
 
 makeInitOccurences :: [(Symbol, Fuel)] -> [Equation] -> Expr -> [Occurence]
 makeInitOccurences xs eqs e 
-  = [Occ x es xs | (EVar x, es) <- splitEApp <$> eapps e
-                 , Eq x' xs' _ <- eqs, x == x'
+  = [Occ x es xs eqi | (EVar x, es) <- splitEApp <$> eapps e
+                 , Eq x' xs' _ eqi <- eqs, x == x'
                  , length xs' == length es]  
 
 grepOccurences :: [Equation] -> (Expr, FuelMap) -> [Occurence]
 grepOccurences eqs (e, fs) 
   = filter (goodFuelMap . ofuel)  
-           [Occ x es fs | (EVar x, es) <- splitEApp <$> eapps e
-                        , Eq x' xs' _ <- eqs, x == x'
+           [Occ x es fs eqi | (EVar x, es) <- splitEApp <$> eapps e
+                        , Eq x' xs' _ eqi <- eqs, x == x'
                         , length xs' == length es]  
 
 goodFuelMap :: FuelMap -> Bool 
 goodFuelMap = any ((>0) . snd)
 
 unfold :: [Equation] -> Occurence -> [(Expr, FuelMap)]
-unfold eqs (Occ x es fs) 
+unfold eqs (Occ x es fs _) 
   = catMaybes [if hasFuel fs x then Just (subst (mkSubst $ zip  xs' es) e, makeFuelMap (\x -> x-1) fs x) else Nothing 
-              | Eq x' xs' e <- eqs
+              | Eq x' xs' e _ <- eqs
               , x == x'
               , length xs' == length es]  
 
@@ -187,13 +319,16 @@ makeFuelMap f ((x, fx):fs) y
   | otherwise = (x, fx)   : makeFuelMap f fs y
 makeFuelMap _ _ _ = error "makeFuelMap"
 
-data Occurence = Occ {ofun :: Symbol, oargs :: [Expr], ofuel :: FuelMap}
- deriving (Show)
-
 
 type Fuel = Int 
-
 type FuelMap = [(Symbol, Fuel)]
+
+data Occurence = Occ {ofun :: Symbol, oargs :: [Expr], ofuel :: FuelMap, oinfo :: EqInfo}
+
+instance Show Occurence where
+  show occ = showpp (ofun occ) ++ "(" ++ showpp (oargs occ) ++ ")" -- ++ " fuel =" ++ show (ofuel occ)
+
+
 
 
 
